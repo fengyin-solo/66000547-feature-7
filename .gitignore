@@ -234,3 +234,6 @@ sandbox/
 *.pid
 *.seed
 *.pid.lock
+
+# Batch rule store (runtime persistence)
+backend/app/rules_store.json

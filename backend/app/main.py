@@ -1,12 +1,219 @@
-import re, math, time, random
+import re, math, time, random, json, threading
+from pathlib import Path
 import numpy as np
 from collections import defaultdict, Counter
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 app = FastAPI(title="Log Anomaly Detector")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# ---------------------------------------------------------------------------
+# 判定规则存储（服务端为权威口径，持久化到文件，刷新/重启后仍然保留）
+# ---------------------------------------------------------------------------
+RULES_FILE = Path(__file__).resolve().parent / "rules_store.json"
+RULES_LOCK = threading.Lock()
+
+DEFAULT_RULES = [
+    {"id": 1, "name": "高频ERROR", "type": "level", "threshold": 5, "enabled": True, "keywords": []},
+    {"id": 2, "name": "异常流量", "type": "count", "threshold": 200, "enabled": False, "keywords": []},
+    {"id": 3, "name": "关键词命中", "type": "keyword", "threshold": 0, "enabled": True,
+     "keywords": ["timeout", "failed", "exhausted", "error"]},
+]
+VALID_RULE_TYPES = {"level", "count", "keyword"}
+BATCH_ACTIONS = {"enable", "disable", "set_keywords"}
+MAX_KEYWORDS = 50
+MAX_KEYWORD_LEN = 32
+
+
+def normalize_rule(r):
+    r = r if isinstance(r, dict) else {}
+    return {
+        "id": int(r.get("id", 0)),
+        "name": str(r.get("name", "")),
+        "type": str(r.get("type", "")),
+        "threshold": int(r.get("threshold", 0) or 0),
+        "enabled": bool(r.get("enabled", False)),
+        "keywords": [str(k) for k in r.get("keywords", []) if str(k).strip()],
+    }
+
+
+def load_rules():
+    try:
+        raw = json.loads(RULES_FILE.read_text(encoding="utf-8"))
+        rules = [normalize_rule(r) for r in raw if isinstance(r, dict) and r.get("id")]
+        if rules:
+            return rules
+    except Exception:
+        pass
+    return [normalize_rule(r) for r in DEFAULT_RULES]
+
+
+def save_rules():
+    try:
+        tmp = RULES_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(RULES, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(RULES_FILE)
+    except Exception:
+        pass  # 持久化失败不影响当次内存中的生效结果
+
+
+RULES = load_rules()
+
+# batchId -> {"fingerprint": str, "response": dict}，保证同一批次重复提交只生效一次
+BATCH_TOKENS: dict = {}
+
+
+class GenerateRequest(BaseModel):
+    type: str = "nginx"
+    count: int = 1000
+    rules: list = []
+
+
+class DetectRequest(BaseModel):
+    logs: list
+    rules: list = []
+    query: str = ""
+
+
+class BatchRequest(BaseModel):
+    batch_id: str
+    action: str
+    rule_ids: list
+    keywords: list = []
+
+
+@app.get("/api/rules")
+def get_rules():
+    with RULES_LOCK:
+        return {"rules": [dict(r) for r in RULES]}
+
+
+@app.post("/api/rules/batch")
+def batch_update_rules(req: BatchRequest):
+    batch_id = (req.batch_id or "").strip()
+    if not batch_id:
+        raise HTTPException(status_code=400, detail="缺少 batch_id")
+    action = req.action
+    if action not in BATCH_ACTIONS:
+        raise HTTPException(status_code=400, detail=f"不支持的批量操作: {action}")
+    raw_ids = req.rule_ids if isinstance(req.rule_ids, list) else []
+    try:
+        ids = [int(x) for x in raw_ids]
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="rule_ids 必须是整数数组")
+    if not ids:
+        raise HTTPException(status_code=400, detail="至少选择一条规则")
+
+    # 归一化关键词词表
+    norm_keywords, invalid_keywords = [], []
+    for k in req.keywords if isinstance(req.keywords, list) else []:
+        k = str(k).strip().lower()
+        if not k:
+            continue
+        if len(k) > MAX_KEYWORD_LEN:
+            invalid_keywords.append(k)
+        elif k not in norm_keywords:
+            norm_keywords.append(k)
+    if len(norm_keywords) > MAX_KEYWORDS:
+        raise HTTPException(status_code=400, detail=f"关键词数量不能超过 {MAX_KEYWORDS} 个")
+
+    # 同一批次的幂等指纹：操作 + 去重后的规则集合 + 词表内容
+    fingerprint = json.dumps({
+        "action": action,
+        "rule_ids": sorted(set(ids)),
+        "keywords": sorted(norm_keywords),
+    }, ensure_ascii=False)
+
+    with RULES_LOCK:
+        cached = BATCH_TOKENS.get(batch_id)
+        if cached is not None:
+            if cached["fingerprint"] != fingerprint:
+                raise HTTPException(
+                    status_code=409,
+                    detail="该批次已提交过不同的操作内容，请取消后用新批次重新下发",
+                )
+            resp = dict(cached["response"])
+            resp["idempotent"] = True  # 重复提交：直接回放结果，不再改动规则
+            return resp
+
+        index = {r["id"]: r for r in RULES}
+        results = []
+        seen = set()
+        duplicated_ids = set()
+        for rid in ids:
+            if rid in seen:
+                duplicated_ids.add(rid)
+                continue
+            seen.add(rid)
+            rule = index.get(rid)
+            if rule is None:
+                results.append({
+                    "ruleId": rid, "ruleName": "", "success": False, "changed": False,
+                    "reason": "规则不存在（可能已被删除）",
+                })
+                continue
+            if action == "enable":
+                changed = not rule["enabled"]
+                rule["enabled"] = True
+                results.append(_ok(rule, changed))
+            elif action == "disable":
+                changed = rule["enabled"]
+                rule["enabled"] = False
+                results.append(_ok(rule, changed))
+            else:  # set_keywords
+                if rule["type"] != "keyword":
+                    results.append({
+                        "ruleId": rid, "ruleName": rule["name"], "success": False, "changed": False,
+                        "reason": f"规则类型为 {rule['type']}，不是关键词规则，不能改命中词表",
+                    })
+                elif invalid_keywords:
+                    results.append({
+                        "ruleId": rid, "ruleName": rule["name"], "success": False, "changed": False,
+                        "reason": f"关键词超长（>{MAX_KEYWORD_LEN}字符），未改动: {', '.join(invalid_keywords[:3])}",
+                    })
+                elif not norm_keywords:
+                    results.append({
+                        "ruleId": rid, "ruleName": rule["name"], "success": False, "changed": False,
+                        "reason": "词表不能为空",
+                    })
+                else:
+                    changed = rule["keywords"] != norm_keywords
+                    rule["keywords"] = list(norm_keywords)
+                    results.append(_ok(rule, changed))
+
+        save_rules()
+        success_count = sum(1 for r in results if r["success"])
+        response = {
+            "batchId": batch_id,
+            "action": action,
+            "idempotent": False,
+            "results": results,
+            "successCount": success_count,
+            "failureCount": len(results) - success_count,
+            "duplicatedIds": sorted(duplicated_ids),
+            "rules": [dict(r) for r in RULES],
+        }
+        BATCH_TOKENS[batch_id] = {"fingerprint": fingerprint, "response": response}
+        return dict(response)
+
+
+def _ok(rule, changed):
+    return {
+        "ruleId": rule["id"], "ruleName": rule["name"],
+        "success": True, "changed": changed,
+        "reason": "" if changed else "目标状态与当前一致，无需改动",
+    }
+
+
+@app.delete("/api/rules/batch/{batch_id}")
+def release_batch(batch_id: str):
+    with RULES_LOCK:
+        existed = BATCH_TOKENS.pop(batch_id, None) is not None
+    # 取消后同一 batchId 若再次提交将重新生效；前端通常直接换发新批次
+    return {"released": existed}
+
 
 LOG_TEMPLATES = {
     "nginx": {
@@ -64,17 +271,6 @@ LOG_TEMPLATES = {
 }
 
 
-class GenerateRequest(BaseModel):
-    type: str = "nginx"
-    count: int = 1000
-
-
-class DetectRequest(BaseModel):
-    logs: list
-    rules: list = []
-    query: str = ""
-
-
 @app.post("/api/generate")
 def generate_logs(req: GenerateRequest):
     tmpl = LOG_TEMPLATES.get(req.type, LOG_TEMPLATES["nginx"])
@@ -89,7 +285,7 @@ def generate_logs(req: GenerateRequest):
             "message": entry["message"],
             "raw": f"[{entry['timestamp']}] [{entry['level']}] [{entry['source']}] {entry['message']}"
         })
-    return analyze_logs(logs, [], "")
+    return analyze_logs(logs, req.rules, "")
 
 
 @app.post("/api/detect")
@@ -156,6 +352,25 @@ def analyze_logs(logs_data, rules, query):
                     "severity": "medium", "message": f"窗口{w['start']}日志量{w['count']}超过阈值",
                     "timestamp": time.strftime("%H:%M:%S")
                 })
+            if rule.get("type") == "keyword":
+                keywords = [str(k).lower() for k in rule.get("keywords", []) if str(k).strip()]
+                if keywords:
+                    chunk = logs[w["start"]:w["end"]]
+                    hit_keys = set()
+                    hit_count = 0
+                    for l in chunk:
+                        text = str(l.get("raw", "")).lower()
+                        hits = [k for k in keywords if k in text]
+                        if hits:
+                            hit_count += 1
+                            hit_keys.update(hits)
+                    if hit_count > rule.get("threshold", 0):
+                        alerts.append({
+                            "id": len(alerts) + 1, "ruleName": rule.get("name", "关键词命中"),
+                            "severity": "medium",
+                            "message": f"窗口{w['start']}关键词命中{hit_count}条（{', '.join(sorted(hit_keys))}）",
+                            "timestamp": time.strftime("%H:%M:%S")
+                        })
 
     # Full-text search with TF-IDF
     if query:
@@ -168,7 +383,7 @@ def analyze_logs(logs_data, rules, query):
                 scored.append((score, log))
         logs = [l for _, l in sorted(scored, key=lambda x: x[0], reverse=True)]
 
-    # Add non-rule alerts for high anomaly windows  
+    # Add non-rule alerts for high anomaly windows
     for a in anomalies:
         if a["isAnomaly"]:
             alerts.append({
