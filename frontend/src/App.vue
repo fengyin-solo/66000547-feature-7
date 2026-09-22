@@ -15,7 +15,8 @@
       <div class="grid-col">
         <LogTable />
       </div>
-      <div class="grid-col">
+      <div class="grid-col right-col">
+        <RulePanel />
         <AnomalyChart />
         <AlertPanel />
       </div>
@@ -29,6 +30,7 @@
 
 <script setup lang="ts">
 import LogTable from './components/LogTable.vue'
+import RulePanel from './components/RulePanel.vue'
 import AnomalyChart from './components/AnomalyChart.vue'
 import AlertPanel from './components/AlertPanel.vue'
 import TrendChart from './components/TrendChart.vue'
@@ -46,5 +48,6 @@ body{font-family:system-ui,monospace;background:#0f172a;color:#e2e8f0}
 .toolbar{display:flex;gap:8px;align-items:center}
 .main-grid{display:grid;grid-template-columns:1fr 400px;gap:12px;padding:12px 20px;min-height:50vh}
 .grid-col{overflow:hidden}
+.right-col{overflow-y:auto;display:flex;flex-direction:column;gap:12px;padding-right:4px}
 .bottom-row{display:grid;grid-template-columns:1fr 1fr;gap:12px;padding:0 20px 16px}
 </style>

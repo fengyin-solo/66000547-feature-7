@@ -1,9 +1,9 @@
-import re, math, time, random
+import re, math, time, random, uuid
 import numpy as np
 from collections import defaultdict, Counter
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 app = FastAPI(title="Log Anomaly Detector")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -73,6 +73,130 @@ class DetectRequest(BaseModel):
     logs: list
     rules: list = []
     query: str = ""
+
+
+class BatchRulesRequest(BaseModel):
+    rules: list
+    operation: str
+    rule_ids: list = Field(default_factory=list)
+    keywords: list = Field(default_factory=list)
+    batch_id: str = ""
+
+
+# Cache of batch_id -> {rules, results}; replaying the same batch id is a no-op.
+BATCH_CACHE: dict = {}
+
+
+def _clean_keyword(raw):
+    kw = str(raw).strip().lower() if raw is not None else ""
+    return kw
+
+
+@app.post("/api/rules/batch")
+def batch_update_rules(req: BatchRulesRequest):
+    operation = req.operation
+    valid_ops = {"enable", "disable", "set_keywords"}
+    if operation not in valid_ops:
+        raise HTTPException(status_code=400, detail=f"未知批量操作: {operation}")
+    if not req.batch_id:
+        raise HTTPException(status_code=400, detail="缺少 batch_id")
+    if not req.rule_ids:
+        raise HTTPException(status_code=400, detail="未选择任何规则")
+
+    # Idempotency: the same batch only takes effect once until explicitly released.
+    cached = BATCH_CACHE.get(req.batch_id)
+    if cached is not None:
+        return {
+            "batchId": req.batch_id,
+            "idempotent": True,
+            "rules": cached["rules"],
+            "results": cached["results"],
+            "successCount": sum(1 for r in cached["results"] if r["success"]),
+            "failCount": sum(1 for r in cached["results"] if not r["success"])
+        }
+
+    rules = [dict(r) for r in req.rules if isinstance(r, dict)]
+    rules_by_id = {r.get("id"): r for r in rules}
+
+    keywords = []
+    if operation == "set_keywords":
+        for raw in req.keywords:
+            kw = _clean_keyword(raw)
+            if kw and kw not in keywords:
+                keywords.append(kw)
+        if not keywords:
+            raise HTTPException(status_code=400, detail="关键词词表不能为空")
+
+    # Duplicate ids in the same submission are executed only once.
+    seen_ids = set()
+    results = []
+    for raw_id in req.rule_ids:
+        if raw_id in seen_ids:
+            results.append({
+                "ruleId": raw_id, "ruleName": "", "success": True,
+                "action": "skipped_duplicate",
+                "message": "同一批次内重复提交，已去重，只生效一次"
+            })
+            continue
+        seen_ids.add(raw_id)
+
+        rule = rules_by_id.get(raw_id)
+        if rule is None:
+            results.append({
+                "ruleId": raw_id, "ruleName": "", "success": False,
+                "action": operation, "message": "规则不存在或已被删除"
+            })
+            continue
+
+        name = rule.get("name", f"规则{raw_id}")
+        if operation == "enable":
+            if rule.get("enabled"):
+                results.append({"ruleId": raw_id, "ruleName": name, "success": True,
+                                "action": "enable", "changed": False,
+                                "message": "规则已是启用状态，无需变更"})
+            else:
+                rule["enabled"] = True
+                results.append({"ruleId": raw_id, "ruleName": name, "success": True,
+                                "action": "enable", "changed": True,
+                                "message": "已启用"})
+        elif operation == "disable":
+            if not rule.get("enabled"):
+                results.append({"ruleId": raw_id, "ruleName": name, "success": True,
+                                "action": "disable", "changed": False,
+                                "message": "规则已是停用状态，无需变更"})
+            else:
+                rule["enabled"] = False
+                results.append({"ruleId": raw_id, "ruleName": name, "success": True,
+                                "action": "disable", "changed": True,
+                                "message": "已停用"})
+        else:  # set_keywords
+            if rule.get("type") != "keyword":
+                results.append({"ruleId": raw_id, "ruleName": name, "success": False,
+                                "action": "set_keywords",
+                                "message": f"非关键词类型规则（{rule.get('type')}）不能设置关键词词表"})
+            else:
+                rule["keywords"] = list(keywords)
+                results.append({"ruleId": raw_id, "ruleName": name, "success": True,
+                                "action": "set_keywords", "changed": True,
+                                "message": f"词表已更新为 {len(keywords)} 个关键词：{', '.join(keywords)}"})
+
+    payload = {
+        "batchId": req.batch_id,
+        "idempotent": False,
+        "rules": rules,
+        "results": results,
+        "successCount": sum(1 for r in results if r["success"]),
+        "failCount": sum(1 for r in results if not r["success"])
+    }
+    BATCH_CACHE[req.batch_id] = {"rules": rules, "results": results}
+    return payload
+
+
+@app.delete("/api/rules/batch/{batch_id}")
+def release_batch(batch_id: str):
+    """Cancel/close a submitted batch so the same operation can be sent again."""
+    existed = BATCH_CACHE.pop(batch_id, None) is not None
+    return {"batchId": batch_id, "released": existed}
 
 
 @app.post("/api/generate")
@@ -156,6 +280,26 @@ def analyze_logs(logs_data, rules, query):
                     "severity": "medium", "message": f"窗口{w['start']}日志量{w['count']}超过阈值",
                     "timestamp": time.strftime("%H:%M:%S")
                 })
+            if rule.get("type") == "keyword":
+                kw_list = [_clean_keyword(k) for k in rule.get("keywords", [])]
+                kw_list = [k for k in kw_list if k]
+                threshold = rule.get("threshold", 0) or 0
+                hits = {}
+                hit_total = 0
+                for kw in kw_list:
+                    c = sum(1 for l in chunk if kw in str(l.get("raw", "")).lower())
+                    if c:
+                        hits[kw] = c
+                        hit_total += c
+                if hit_total > threshold:
+                    detail = ", ".join(f"{k}×{v}" for k, v in hits.items())
+                    alerts.append({
+                        "id": len(alerts) + 1, "ruleName": rule.get("name", "关键词命中"),
+                        "severity": "medium",
+                        "message": f"窗口{w['start']}命中关键词({detail})，共{hit_total}条"
+                                   + (f"，超过阈值{threshold}" if threshold else ""),
+                        "timestamp": time.strftime("%H:%M:%S")
+                    })
 
     # Full-text search with TF-IDF
     if query:

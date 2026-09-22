@@ -17,7 +17,7 @@ const alerts = computed(() => store.result?.alerts || [])
 </script>
 
 <style scoped>
-.panel{background:#1e293b;border-radius:8px;padding:12px;border:1px solid #334155;margin-top:12px}
+.panel{background:#1e293b;border-radius:8px;padding:12px;border:1px solid #334155}
 .panel h4{color:#f87171;font-size:13px;margin-bottom:8px}
 .empty{color:#64748b;font-size:12px}
 .alert-row{display:flex;gap:8px;padding:4px 6px;margin:2px 0;border-radius:4px;font-size:11px;align-items:flex-start}
